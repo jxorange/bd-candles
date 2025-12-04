@@ -409,6 +409,10 @@
         var MAX_LIVES = 3;
         var INVINCIBLE_DURATION = 5000; // ms
 
+        // 🧁 蛋糕演出參數
+        var CUPCAKE_MORPH_DURATION = 2000; // 前 2 秒：原本物件一個一個變蛋糕
+        var CUPCAKE_TOTAL_DURATION = 6000; // 整個蛋糕時間共 6 秒
+
         var gameRunning = false;
         var lastTimestamp = 0;
         var spawnTimer = 0;
@@ -426,6 +430,9 @@
           movingLeft: false,
           movingRight: false,
           elapsed: 0,
+          // 🧁 結局用
+          endingCupcakePhase: false,
+          cupcakeStartTime: 0,
         };
 
         function updateHUD() {
@@ -452,6 +459,8 @@
           gameState.elapsed = 0;
           spawnTimer = 0;
           lastTimestamp = 0;
+          gameState.endingCupcakePhase = false;
+          gameState.cupcakeStartTime = 0;
 
           gameState.playerWidth = 40;
           gameState.playerHeight = 40;
@@ -511,17 +520,24 @@
             if (item.type === "candle") emoji = "🕯️";
             if (item.type === "bomb") emoji = "🧨";
             if (item.type === "dog") emoji = "🐕";
+            if (item.type === "cupcake") emoji = "🧁";
             ctx.fillText(emoji, item.x, item.y);
           }
         }
 
-        // -------- 掉落物邏輯 --------
+        // -------- 掉落物邏輯（一般模式） --------
         function spawnItem() {
           var r = Math.random();
           var type;
-          if (r < 0.6) type = "candle";
-          else if (r < 0.9) type = "bomb";
+          // 降低狗狗出現機率：蠟燭 65%，炸彈 32%，狗 3%
+          if (r < 0.65) type = "candle";
+          else if (r < 0.97) type = "bomb";
           else type = "dog";
+
+          // 如果已經是無敵狀態，就不要再丟狗狗，改成炸彈，避免一直連續無敵
+          if (gameState.invincible && type === "dog") {
+            type = "bomb";
+          }
 
           var margin = 20;
           var x = margin + Math.random() * (width - margin * 2);
@@ -532,10 +548,34 @@
           var extra = level * 0.009;
           var speed = baseSpeed + extra;
 
-          gameState.items.push({ x: x, y: y, speed: speed, type: type });
+          gameState.items.push({
+            x: x,
+            y: y,
+            speed: speed,
+            type: type,
+          });
         }
 
+        // -------- 🧁 開始蛋糕演出 --------
+        function startCupcakeEnding(now) {
+          if (gameState.endingCupcakePhase) return;
+          gameState.endingCupcakePhase = true;
+          gameState.cupcakeStartTime = now;
+
+          // 為目前場上的每個物件設定一個隨機變身時間
+          for (var i = 0; i < gameState.items.length; i++) {
+            var item = gameState.items[i];
+            item.morphAt =
+              gameState.cupcakeStartTime +
+              Math.random() * CUPCAKE_MORPH_DURATION;
+          }
+        }
+
+        // -------- 碰撞 --------
         function handleCollisions(now) {
+          // 進入蛋糕海之後就不再吃判定，只看演出
+          if (gameState.endingCupcakePhase) return;
+
           var pw = gameState.playerWidth;
           var ph = gameState.playerHeight;
           var px = gameState.playerX - pw / 2;
@@ -556,9 +596,11 @@
               if (item.type === "candle") {
                 gameState.candles += 1;
                 if (gameState.candles >= TARGET_CANDLES) {
+                  // 停在 28，啟動蛋糕演出
+                  gameState.candles = TARGET_CANDLES;
                   updateHUD();
-                  endGame(true);
-                  return;
+                  startCupcakeEnding(now);
+                  // 不立刻結束，在 update 裡跑蛋糕動畫
                 }
               } else if (item.type === "bomb") {
                 if (!gameState.invincible) {
@@ -580,9 +622,79 @@
           gameState.items = remaining;
         }
 
+        // -------- 🧁 蛋糕演出階段更新 --------
+        function updateCupcakePhase(delta, now) {
+          var elapsedCupcake = now - gameState.cupcakeStartTime;
+
+          // 1. 先處理原本場上的物件：前兩秒內依序變成蛋糕，並且往下掉
+          for (var i = 0; i < gameState.items.length; i++) {
+            var item = gameState.items[i];
+
+            // 沒設定過 morphAt 的就給一個（保險）
+            if (typeof item.morphAt === "undefined") {
+              item.morphAt =
+                gameState.cupcakeStartTime +
+                Math.random() * CUPCAKE_MORPH_DURATION;
+            }
+
+            if (now >= item.morphAt) {
+              item.type = "cupcake";
+            }
+
+            item.y += item.speed * delta;
+          }
+
+          // 2. 移除掉出畫面的舊物件
+          var kept = [];
+          for (var j = 0; j < gameState.items.length; j++) {
+            if (gameState.items[j].y < height + 60) {
+              kept.push(gameState.items[j]);
+            }
+          }
+          gameState.items = kept;
+
+          // 3. 從第 3 秒開始，被蛋糕海淹沒：開始大量產生新的杯子蛋糕
+          if (elapsedCupcake > CUPCAKE_MORPH_DURATION) {
+            var over = elapsedCupcake - CUPCAKE_MORPH_DURATION;
+            var ramp = Math.min(over / 2000, 1); // 在 2~4 秒之間把量推到最大
+
+            // 依照 delta 算當下要丟幾顆蛋糕
+            var baseRate = 3; // 每 16ms 基礎 3 顆
+            var extraRate = 9 * ramp; // 隨時間增加到最多 +9
+            var ratePerFrame = baseRate + extraRate;
+            var cupcakesToSpawn = Math.floor(ratePerFrame * (delta / 16));
+
+            for (var k = 0; k < cupcakesToSpawn; k++) {
+              var margin = 10;
+              var x = margin + Math.random() * (width - margin * 2);
+              var y = -20 - Math.random() * 40;
+              gameState.items.push({
+                x: x,
+                y: y,
+                speed: 0.25 + Math.random() * 0.15,
+                type: "cupcake",
+              });
+            }
+          }
+
+          draw();
+          updateHUD();
+
+          // 4. 6 秒後，正式跳到成功畫面
+          if (elapsedCupcake >= CUPCAKE_TOTAL_DURATION) {
+            endGame(true);
+          }
+        }
+
         // -------- 更新 --------
         function update(delta, now) {
           gameState.elapsed += delta;
+
+          // 如果在蛋糕演出階段，改由 updateCupcakePhase 處理
+          if (gameState.endingCupcakePhase) {
+            updateCupcakePhase(delta, now);
+            return;
+          }
 
           // 玩家移動
           var moveSpeed = 0.35;
@@ -665,7 +777,7 @@
               "—— by 頂尖大師橘";
             typeText(endTextEl, successText, 50);
             endStatsEl.textContent =
-              "蠟燭：28 根\n" + "炸彈：" + gameState.bombsHit + " 顆";
+              "蠟燭：28 根\n" + "炸彈：" + gameState.bombsHit + " 條";
           } else {
             endTitleEl.textContent = "💥 失敗 💥";
             var failText =
